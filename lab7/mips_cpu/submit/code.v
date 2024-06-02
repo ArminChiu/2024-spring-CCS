@@ -28,16 +28,15 @@ module top_module(
 
 	wire [31:0]PCadd = PC + 4;
 	wire [31:0]Signimm = (op == 6'b001111) ? {Instruction[15:0], 16'b0} : //lui
+						(op[5:2] == 4'b0011) ? {16'b0, Instruction[15:0]} : //andi ori xori
 							{{16{Instruction[15]}}, Instruction[15:0]};
 	wire [31:0]PCBranch = PCadd + (Signimm << 2);
 	wire [31:0]PCJR = RF_rdata1;
 	wire [31:0]PCJA = {PCadd[31:28], Instruction[25:0], 2'b00};
-
-	assign Address = ALU_Result;
-	assign Write_data = RF_rdata2;
-	assign Write_strb = 4'b1111;
-	assign MemRead = Instruction[31:26] == 6'b100011;
 	
+	assign Address = Address_out;
+	assign Write_data = Data_out;
+
 	//R类型
 	wire [5:0] op = Instruction[31:26];
 	wire [4:0] rs = Instruction[25:21];
@@ -59,10 +58,10 @@ module top_module(
 								((op == 6'b000000 && func == 6'b001001 && rd == 5'b00000) || op == 6'b000011) ? 5'b11111 : //jalr jr
 								 rd;
 	wire [4:0]		RF_raddr1 = rs;
-	wire [4:0]		RF_raddr2 = rt;
+	wire [4:0]		RF_raddr2 = (op == 6'b000001 && rt == 5'b00001) ? rt - 1 : rt;
 	wire			RF_wen;
 	wire [31:0]		RF_wdata = (MemtoReg == 2'b00) ? ALU_Result :
-									(MemtoReg == 2'b01) ? Read_data :
+									(MemtoReg == 2'b01) ? Data_out :
 									(MemtoReg == 2'b10) ? PCadd + 4 :
 									0;
 	wire [31:0]		RF_rdata1;
@@ -87,6 +86,7 @@ module top_module(
 	wire 		ALU_Overflow;
 	wire 		ALU_CarryOut;
 	wire 		ALU_Zero;
+	wire		ALU_Signal;
 	wire [31:0] ALU_Result;	
 
 	alu ALU(
@@ -96,7 +96,22 @@ module top_module(
 		.Overflow(ALU_Overflow),
 		.CarryOut(ALU_CarryOut),
 		.Zero(ALU_Zero),
+		.Signal(ALU_Signal),
 		.Result(ALU_Result)
+	);
+
+	//数据转换器
+	wire [31:0] Data_out;
+	wire [31:0] Address_out;
+
+	dataconverter Dataconverter(
+		.Instruction(Instruction),
+		.Address_in(ALU_Result),
+		.Data_rf2(RF_rdata2),
+		.Data_in(Read_data),
+		.Address_out(Address_out),
+		.Data_out(Data_out),
+		.Write_strb(Write_strb)
 	);
 
 	//控制器
@@ -113,6 +128,7 @@ module top_module(
 	controller Controller(
 		.Instruction(Instruction),
 		.Zero(ALU_Zero),
+		.Signal(ALU_Signal),
 		.MemtoReg(MemtoReg),
 		.MemWrite(MemWrite),
 		.ALUop(ALU_ALUop),
@@ -120,7 +136,8 @@ module top_module(
 		.RegWrite(RF_wen),
 		.RegDst(RegDst),
 		.PCSrc(PCSrc),
-		.ALUsa(ALUsa)
+		.ALUsa(ALUsa),
+		.MemRead(MemRead)
 	);								
 					
 endmodule
@@ -150,7 +167,7 @@ module reg_file(
         if(wen) begin
             //0号寄存器不可写
             if(waddr != 0) begin
-                mem[waddr] <= wdata;
+            	mem[waddr] <= wdata;
             end
         end
     end
@@ -165,8 +182,8 @@ module alu(
 	output Overflow,
 	output CarryOut,
 	output Zero,
-	output [`DATA_WIDTH - 1:0] Result,
-	output signal
+	output Signal,
+	output [`DATA_WIDTH - 1:0] Result
 );
 
 	//加减法条件判断 Result_S为加一符号位，仅在此处生成了一个加法器
@@ -185,16 +202,16 @@ module alu(
 
     //零及其他标志信号
     assign Zero = (ALUop == 4'b0101 && Result_S == 0) ? 1 : //减
-					(ALUop == 4'b1000 && B != 0) ? 1 : //movn
-					(ALUop == 4'b1001 && B == 0) ? 1 : //movz
-					(ALUop == 4'b0110 && Result_Slt == 1) ? 1 : //slt
-					(ALUop == 4'b0111 && Result_Sltu == 1) ? 1 : //sltu
+					(ALUop == 4'b0110 && A == 0) ? 1 : 0; //branch
+	assign Signal = (ALUop[3:1] == 3'b100 && B == 0) ? 1 : //movn movz
+					(ALUop == 4'b0110) ? Result_Slt : //slt
+					(ALUop == 4'b0111) ? Result_Sltu : //sltu
+					(ALUop == 4'b1101) ? !A[`DATA_WIDTH - 1] : //bgez
 					0; //默认为0
-
 
     //根据操作码对Result赋值
     wire [`DATA_WIDTH - 1:0] Result_And, Result_Or, Result_Add, Result_Sub, Result_Slt, Result_Sltu, Result_Nor, Result_Xor,
-							Result_Movn, Result_Movz, Result_Sll, Result_Srl, Result_Sra;
+							Result_Mov, Result_Sll, Result_Srl, Result_Sra;
     assign Result_And = A & B;
     assign Result_Or = A | B;
     assign Result_Add = Result_S[`DATA_WIDTH - 1:0];
@@ -204,9 +221,9 @@ module alu(
 	assign Result_Nor = ~(A | B);
 	assign Result_Xor = A ^ B;
 	assign Result_Mov = A;
-	assign Result_Sll = B << A;
-	assign Result_Srl = B >> A;
-	assign Result_Sra = $signed(B) >>> A;
+	assign Result_Sll = B << A[4:0];
+	assign Result_Srl = B >> A[4:0];
+	assign Result_Sra = $signed(B) >>> A[4:0];
     assign Result = (ALUop == 4'b0000) ? Result_Add : //加
                 (ALUop == 4'b0001) ? Result_And : //与
                 (ALUop == 4'b0010) ? Result_Or : //或
@@ -215,19 +232,139 @@ module alu(
                 (ALUop == 4'b0101) ? Result_Sub : //减
                 (ALUop == 4'b0110) ? Result_Slt : //有符号小于
                 (ALUop == 4'b0111) ? Result_Sltu : //无符号小于
-				(ALUop == 4'b1000 && Zero == 1) ? Result_Mov : //movn
-				(ALUop == 4'b1001 && Zero == 1) ? Result_Mov : //movz
+				(ALUop[3:1] == 3'b100 && (Signal ^ ALUop[0] == 0)) ? Result_Mov : //movn movz
 				(ALUop == 4'b1010) ? Result_Sll : //逻辑左移
 				(ALUop == 4'b1011) ? Result_Srl : //逻辑右移
 				(ALUop == 4'b1100) ? Result_Sra : //算术右移
                 32'b0; //默认为0
 endmodule
 
+//存取数转换器
+module dataconverter(
+	input [`DATA_WIDTH - 1:0] Instruction, //l s
+	input [31:0] Address_in, //l s
+	input [31:0] Data_rf2, //l s
+	input [31:0] Data_in, //l
+	output [31:0] Address_out, //l s
+	output [31:0] Data_out, //l s
+	output [3:0] Write_strb //s
+);
+	//地址对齐
+	assign Address_out = {Address_in[31:2], 2'b00};
+	wire [1:0] n = Address_in[1:0];
+	wire [31:0] Data_lwr = (n == 2'b00) ? Data_in :
+							(n == 2'b01) ? {Data_rf2[31:24], Data_in[31:8]} :
+							(n == 2'b10) ? {Data_rf2[31:16], Data_in[31:16]} :
+							(n == 2'b11) ? {Data_rf2[31:8], Data_in[31:24]} :
+							32'b0;
+
+	wire [31:0] Data_lwl = (n == 2'b00) ? {Data_in[7:0], Data_rf2[23:0]} :
+							(n == 2'b01) ? {Data_in[15:0], Data_rf2[15:0]} :
+							(n == 2'b10) ? {Data_in[23:0], Data_rf2[7:0]} :
+							(n == 2'b11) ? Data_in :
+							32'b0;
+	
+	wire [31:0] Data_lb = (n == 2'b00) ? {{24{Data_in[7]}}, Data_in[7:0]} :
+						(n == 2'b01) ? {{24{Data_in[15]}}, Data_in[15:8]} :
+						(n == 2'b10) ? {{24{Data_in[23]}}, Data_in[23:16]} :
+						(n == 2'b11) ? {{24{Data_in[31]}}, Data_in[31:24]} :
+						32'b0;
+
+	wire [31:0] Data_lbu = (n == 2'b00) ? {{24'b0, Data_in[7:0]}} :
+						(n == 2'b01) ? {{24'b0, Data_in[15:8]}} :
+						(n == 2'b10) ? {{24'b0, Data_in[23:16]}} :
+						(n == 2'b11) ? {{24'b0, Data_in[31:24]}} :
+						32'b0;
+	
+	wire [31:0] Data_lh = (n == 2'b00) ? {{16{Data_in[15]}}, Data_in[15:0]} :
+						(n == 2'b10) ? {{16{Data_in[31]}}, Data_in[31:16]} :
+						32'b0;
+
+	wire [31:0] Data_lhu = (n == 2'b00) ? {{16'b0, Data_in[15:0]}} :
+						(n == 2'b10) ? {{16'b0, Data_in[31:16]}} :
+						32'b0;
+
+	wire [31:0] Data_load = (Instruction[28:26] == 3'b011) ? Data_in : //lw
+							(Instruction[28:26] == 3'b000) ? Data_lb : //lb
+							(Instruction[28:26] == 3'b001) ? Data_lh : //lh
+							(Instruction[28:26] == 3'b100) ? Data_lbu : //lbu
+							(Instruction[28:26] == 3'b101) ? Data_lhu : //lhu
+							(Instruction[28:26] == 3'b010) ? Data_lwl : //lwl
+							(Instruction[28:26] == 3'b110) ? Data_lwr : //lwr
+							32'b0; //默认为0
+	
+	//存字节 数据及掩码
+	wire [31:0] Data_sb = (n == 2'b00) ? {24'b0, Data_rf2[7:0]} :
+						(n == 2'b01) ? {16'b0, Data_rf2[7:0],8'b0} :
+						(n == 2'b10) ? {8'b0, Data_rf2[7:0],16'b0} :
+						(n == 2'b11) ? {Data_rf2[7:0],24'b0} :
+						32'b0;
+
+	wire [3:0] Write_strb_sb = (n == 2'b00) ? 4'b0001 :
+							(n == 2'b01) ? 4'b0010 :
+							(n == 2'b10) ? 4'b0100 :
+							(n == 2'b11) ? 4'b1000 :
+							4'b0000;
+
+	//存半字 数据及掩码
+	wire [31:0] Data_sh = (n == 2'b00) ? {16'b0, Data_rf2[15:0]} :
+						(n == 2'b10) ? {Data_rf2[15:0],16'b0} :
+						32'b0;
+	wire [3:0] Write_strb_sh = (n == 2'b00) ? 4'b0011 :
+						(n == 2'b10) ? 4'b1100 :
+						4'b0000;
+	
+	//存字高位 数据及掩码
+	wire [31:0] Data_swr = (n == 2'b00) ? Data_rf2 :
+					(n == 2'b01) ? {Data_rf2[23:0], Data_rf2[31:24]} :
+					(n == 2'b10) ? {Data_rf2[15:0], Data_rf2[31:16]} :
+					(n == 2'b11) ? {Data_rf2[7:0], Data_rf2[31:8]} :
+					32'b0;
+	wire [3:0] Write_strb_swr = (n == 2'b00) ? 4'b1111 :
+						(n == 2'b01) ? 4'b1110 :
+						(n == 2'b10) ? 4'b1100 :
+						(n == 2'b11) ? 4'b1000 :
+						4'b0000;
+	
+	//存字低位 数据及掩码
+	wire [31:0] Data_swl = (n == 2'b00) ? {Data_rf2[23:0], Data_rf2[31:24]} :
+					(n == 2'b01) ? {Data_rf2[15:0], Data_rf2[31:16]} :
+					(n == 2'b10) ? {Data_rf2[7:0], Data_rf2[31:8]} :
+					(n == 2'b11) ? Data_rf2 :
+					32'b0;
+	wire [3:0] Write_strb_swl = (n == 2'b00) ? 4'b0001 :
+						(n == 2'b01) ? 4'b0011 :
+						(n == 2'b10) ? 4'b0111 :
+						(n == 2'b11) ? 4'b1111 :
+						4'b0000;
+
+	//存数据
+	wire [31:0] Data_store = (Instruction[28:26] == 3'b010) ? Data_swl : //swl
+							(Instruction[28:26] == 3'b110) ? Data_swr : //swr
+							(Instruction[28:26] == 3'b000) ? Data_sb : //sb
+							(Instruction[28:26] == 3'b001) ? Data_sh : //sh
+							(Instruction[28:26] == 3'b011) ? Data_rf2 : //sw
+							32'b0; //默认为0
+
+	//存掩码
+	assign Write_strb = (Instruction[28:26] == 3'b010) ? Write_strb_swl : //swl
+						(Instruction[28:26] == 3'b110) ? Write_strb_swr : //swr
+						(Instruction[28:26] == 3'b000) ? Write_strb_sb : //sb
+						(Instruction[28:26] == 3'b001) ? Write_strb_sh : //sh
+						4'b1111; //默认为全写
+	
+	assign Data_out = (Instruction[31:29] == 3'b100) ? Data_load : Data_store;
+
+
+endmodule
+
+
 //控制器
 module controller(
 	//输入指令字
 	input [`DATA_WIDTH - 1:0] Instruction,
 	input Zero,
+	input Signal,
 	//输出控制信号
 	output [1:0] MemtoReg,
 	output MemWrite,
@@ -236,37 +373,76 @@ module controller(
 	output RegWrite,
 	output RegDst,
 	output [1:0] PCSrc,
-	output ALUsa
-);
-	wire Branch;
+	output ALUsa,
+	output MemRead
+);	
+	//指令类型
+	//R J I型指令
+	wire R_type = (Instruction[31:26] == 6'b000000);
+	wire J_type = (Instruction[31:26] == 6'b000010) || (Instruction[31:26] == 6'b000011);
+	wire I_type = !R_type && !J_type;
+
+	//已优化完毕的控制信号
+	assign ALUsa = R_type && (Instruction[5:2] == 4'b0000);
+
+	//分支信号
+	wire Branch = (I_type && Instruction[31:29] == 3'b000);
+	wire Branch1 = (Instruction[31:27] == 5'b00010); //beq bne
+	wire Branch2 = (Instruction[31:27] == 5'b00011); //bgtz blez
+	wire Branch3 = (Instruction[31:26] == 6'b000001); //bgez bltz
+	wire BranchSignal = Branch1 & (Zero ^ Instruction[26]) | Branch2 & ((Zero | Signal) ^ Instruction[26]) | Branch3 & (Signal);
+
+	assign PCSrc = R_type && (Instruction[5:1] == 5'b00100) ? 2'b10 : //jr jalr
+					J_type ? 2'b11 : //j jal
+					BranchSignal ? 2'b01 : //beq bne bgtz blez bgez bltz
+					2'b00; //默认为PC+4
+
+	wire jalr = R_type && (Instruction[5:0] == 6'b001001);
+	assign MemtoReg = jalr || (Instruction[31:26] == 6'b000011) ? 2'b10 : //jalr jal
+						(Instruction[31:29] == 3'b100)? 2'b01 : //lw lwl lwr lb lbu lh lhu
+						2'b00; //默认为ALU_Result
+	
+	//R,J指令为1，i指令为0
+	assign RegDst = (R_type | J_type) ? 1 : 0;
+
+	//lw lwl lwr lb lbu lh lhu时读内存
+	assign MemRead = (Instruction[31:29] == 3'b100);
+	//sw swl swr sb sh时写内存
+	assign MemWrite = (Instruction[31:29] == 3'b101);
+
+	assign RegWrite = (I_type && (Instruction[31:29] == 3'b101 || Instruction[31:29] == 3'b000)) ? 0 : //立即数运算和存数
+						(Instruction[31:26] == 6'b000010 || R_type && Instruction[5:0] == 6'b001000) ? 0 : //j jr
+						(R_type && Instruction[5:1] == 5'b00101) ? (Signal ^ Instruction[0]) : 1; //movn movz
+
+	assign ALUSrc = (I_type && !Branch) ? 1 : 0;
+
 	//ALUctrl
-	wire ALU_And, ALU_Or, ALU_Sub, ALU_Slt, ALU_Sltu, ALU_Nor, ALU_Xor, ALU_Movn, ALU_Movz, ALU_Sll, ALU_Srl, ALU_Sra;
+	wire ALU_And, ALU_Or, ALU_Sub, ALU_Slt, ALU_Sltu, ALU_Nor, ALU_Xor, ALU_Movn, ALU_Movz, ALU_Sll, ALU_Srl, ALU_Sra, ALU_Bgez;
 	//and andi
-	assign ALU_And = ((Instruction[31:26] == 6'b000000) && (Instruction[5:0] == 6'b100100)) || (Instruction[31:26] == 6'b001100);
+	assign ALU_And = (R_type && (Instruction[5:0] == 6'b100100)) || (Instruction[31:26] == 6'b001100);
 	//or ori
-	assign ALU_Or = ((Instruction[31:26] == 6'b000000) && (Instruction[5:0] == 6'b100101)) || (Instruction[31:26] == 6'b001101);
+	assign ALU_Or = (R_type && (Instruction[5:0] == 6'b100101)) || (Instruction[31:26] == 6'b001101);
 	//nor
-	assign ALU_Nor = (Instruction[31:26] == 6'b000000) && (Instruction[5:0] == 6'b100111);
+	assign ALU_Nor = R_type && (Instruction[5:0] == 6'b100111);
 	//xor xori
-	assign ALU_Xor = ((Instruction[31:26] == 6'b000000) && (Instruction[5:0] == 6'b100110)) || (Instruction[31:26] == 6'b001110);
-	//slt slti
-	assign ALU_Slt = ((Instruction[31:26] == 6'b000000) && (Instruction[5:0] == 6'b101010)) || (Instruction[31:26] == 6'b001010);
+	assign ALU_Xor = (R_type && (Instruction[5:0] == 6'b100110)) || (Instruction[31:26] == 6'b001110);
+	//slt slti bgtz blez bltz
+	assign ALU_Slt = (R_type && (Instruction[5:0] == 6'b101010)) || (Instruction[31:26] == 6'b001010) || (Instruction[31:27] == 5'b00011) || (Instruction[31:26] == 6'b000001 && !Instruction[16]);
 	//sltu sltiu
-	assign ALU_Sltu = ((Instruction[31:26] == 6'b000000) && (Instruction[5:0] == 6'b101011)) || (Instruction[31:26] == 6'b001011);
-	//subu beq bne bgez bgtz blez bltz movn movz
-	assign ALU_Sub = ((Instruction[31:26] == 6'b000000) && (Instruction[5:0] == 6'b100011)) || (Instruction[31:26] == 6'b000100) 
-					|| (Instruction[31:26] == 6'b000101) || (Instruction[31:26] == 6'b000001) || (Instruction[31:26] == 6'b000111) 
-					|| (Instruction[31:26] == 6'b000110) || (Instruction[31:26] == 6'b000010) || (Instruction[31:26] == 6'b000011);
-	assign ALU_Movn = (Instruction[31:26] == 6'b000000) && (Instruction[5:0] == 6'b001011);
-	assign ALU_Movz = (Instruction[31:26] == 6'b000000) && (Instruction[5:0] == 6'b001010);
-	assign ALU_Sll = (Instruction[31:26] == 6'b000000) && (Instruction[5:0] == 6'b000000);
-	assign ALU_Srl = (Instruction[31:26] == 6'b000000) && (Instruction[5:0] == 6'b000010);
-	assign ALU_Sra = (Instruction[31:26] == 6'b000000) && (Instruction[5:0] == 6'b000011);
+	assign ALU_Sltu = (R_type && (Instruction[5:0] == 6'b101011)) || (Instruction[31:26] == 6'b001011);
+	//subu beq bne
+	assign ALU_Sub = (R_type && (Instruction[5:0] == 6'b100011)) || (Instruction[31:27] == 5'b00010);
+	assign ALU_Movn = R_type && (Instruction[5:0] == 6'b001011);
+	assign ALU_Movz = R_type && (Instruction[5:0] == 6'b001010);
+	assign ALU_Sll = R_type && (Instruction[5:0] == 6'b000000 || Instruction[5:0] == 6'b000100);
+	assign ALU_Srl = R_type && (Instruction[5:0] == 6'b000010 || Instruction[5:0] == 6'b000110);
+	assign ALU_Sra = R_type && (Instruction[5:0] == 6'b000011 || Instruction[5:0] == 6'b000111);
+	assign ALU_Bgez = Instruction[31:26] == 6'b000001 && Instruction[16];
 	assign ALUop = (ALU_And) ? 4'b0001 : //and andi
 					(ALU_Or) ? 4'b0010 : //or ori
 					(ALU_Xor) ? 4'b0011 : //xor xori
 					(ALU_Nor) ? 4'b0100 : //nor
-					(ALU_Sub) ? 4'b0101 : //subu beq bne bgez bgtz blez bltz movn movz
+					(ALU_Sub) ? 4'b0101 : //subu beq bne bgtz blez bltz
 					(ALU_Slt) ? 4'b0110 : //slt slti
 					(ALU_Sltu) ? 4'b0111 : //sltu sltiu
 					(ALU_Movn) ? 4'b1000 : //movn
@@ -274,48 +450,6 @@ module controller(
 					(ALU_Sll) ? 4'b1010 : //sll
 					(ALU_Srl) ? 4'b1011 : //srl
 					(ALU_Sra) ? 4'b1100 : //sra
+					(ALU_Bgez) ? 4'b1101 : //bgez
 					4'b0000; //默认为add
-	assign ALUsa = (Instruction[31:26] == 6'b000000) && (Instruction[5:0] == 6'b000000) ? 1 ://sll
-					(Instruction[31:26] == 6'b000000) && (Instruction[5:0] == 6'b000010) ? 1 ://srl
-					(Instruction[31:26] == 6'b000000) && (Instruction[5:0] == 6'b000011) ? 1 ://sra
-					0; //默认为0
-	
-
-	//控制信号
-	//jalr jal
-	assign MemtoReg = (Instruction[31:26] == 6'b000000) && (Instruction[5:0] == 6'b001001) ? 2'b10 : //jalr
-						(Instruction[31:26] == 6'b000011) ? 2'b10 : //jal
-						(Instruction[31:26] == 6'b100011) || (Instruction[31:26] == 6'b101011) ? 2'b01 : //lw sw
-						2'b00; //默认为ALU_Result
-	assign MemWrite = (Instruction[31:26] == 6'b101011) ? 1 : 0;
-	assign Branch = (Instruction[31:26] == 6'b000100) || (Instruction[31:26] == 6'b000101);
-	//andi ori xori addiu slti sltiu lui
-	assign ALUSrc = (Instruction[31:26] == 6'b001100) || (Instruction[31:26] == 6'b001101) || (Instruction[31:26] == 6'b001110) 
-					|| (Instruction[31:26] == 6'b001001) || (Instruction[31:26] == 6'b001010) || (Instruction[31:26] == 6'b001011) 
-					|| (Instruction[31:26] == 6'b001111) || (Instruction[31:26] == 6'b100011) || (Instruction[31:26] == 6'b101011) ? 1 : 0;
-	//movn movz slt sltu
-	assign RegWrite = (Instruction[31:26] == 6'b000000) && (Instruction[5:0] == 6'b001011) ? Zero : //movn
-						(Instruction[31:26] == 6'b000000) && (Instruction[5:0] == 6'b001010) ? Zero : //movz
-						//jr j beq bne
-						(Instruction[31:26] == 6'b000000) && (Instruction[5:0] == 6'b001000) ? 0 : //jr
-						(Instruction[31:26] == 6'b000010) ? 0 : //j
-						(Instruction[31:26] == 6'b000100) ? 0 : //beq
-						(Instruction[31:26] == 6'b000101) ? 0 : //bne
-						(Instruction[31:26] == 6'b101011) ? 0 : //sw
-						1; //默认为1
-	//r,j指令为1，i指令为0
-	assign RegDst = (Instruction[31:26] == 6'b000000) ? 1 :
-					(Instruction[31:26] == 6'b000010) ? 1 :
-					(Instruction[31:26] == 6'b000011) ? 1 : 0;
-	//jr jalr bne beq
-	assign PCSrc = (Instruction[31:26] == 6'b000000) && (Instruction[5:0] == 6'b001000) ? 2'b10 : //jr
-					(Instruction[31:26] == 6'b000000) && (Instruction[5:0] == 6'b001001) ? 2'b10 : //jalr
-					(Instruction[31:26] == 6'b000010) ? 2'b11 : //j
-					(Instruction[31:26] == 6'b000011) ? 2'b11 : //jal
-					(Instruction[31:26] == 6'b000101) && (Zero == 0) ? 2'b01 : //bne
-					(Instruction[31:26] == 6'b000100) && (Zero == 1) ? 2'b01 : //beq
-					2'b00; //默认为PC+4
-	
-	assign Write_strb = 4'b1111;
-	assign MemRead = Instruction[31:26] == 6'b100011;
 endmodule
