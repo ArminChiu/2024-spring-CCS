@@ -1,2 +1,2 @@
-`define TRACE_FILE "test/sim/min.mem.log"
-`define INST_MEM "test/sim/min.mem"
+`define TRACE_FILE "test/sim/goldbach.mem.log"
+`define INST_MEM "test/sim/goldbach.mem"

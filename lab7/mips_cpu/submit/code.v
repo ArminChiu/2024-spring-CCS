@@ -22,13 +22,20 @@ module top_module(
 		if(rst) begin
 			PC <= 0;
 		end else begin
-			PC <= {32{PCSrc == 2'b00}} & PCadd | //PC+4
+			if(nextPC < 32'h00000000 || nextPC > 32'h80000600) begin
+            // 如果不在，将 PC 设置为错误处理程序的地址
+            	PC <= 32'h80000068;
+        	end else begin
+            // 如果在，更新 PC
+            	PC <= nextPC;
+        	end
+		end
+	end
+	
+	wire [31:0]nextPC = {32{PCSrc == 2'b00}} & PCadd | //PC+4
 					{32{PCSrc == 2'b01}} & PCBranch | //分支
 					{32{PCSrc == 2'b10}} & PCJR | //
 					{32{PCSrc == 2'b11}} & PCJA; //跳转
-		end
-	end
-
 	wire [31:0]PCadd = PC + 4; //顺序执行
 	wire [31:0]Signimm = (op == 6'b001111) ? {Instruction[15:0], 16'b0} : //lui
 						 (op[5:2] == 4'b0011) ? {16'b0, Instruction[15:0]} : //andi ori xori 无符号扩展
@@ -397,9 +404,18 @@ module controller(
 	assign ALU_Sra = R_type && (func == 6'b000011 || func == 6'b000111);
 	
 	//ALUop选择
-	assign ALUop = ({4{ALU_And}} & 4'b001) | ({4{ALU_Or}} & 4'b010) | ({4{ALU_Sub}} & 4'b101) |
-					({4{ALU_Slt}} & 4'b110) | ({4{ALU_Sltu}} & 4'b111) | ({4{ALU_Nor}} & 4'b100) |
-					({4{ALU_Xor}} & 4'b011) | ({4{ALU_Movn}} & 4'b1000) | ({4{ALU_Movz}} & 4'b1001) |
-					({4{ALU_Sll}} & 4'b1010) | ({4{ALU_Srl}} & 4'b1011) | ({4{ALU_Sra}} & 4'b1100) | 
-					({4{ALU_Bgez}} & 4'b1101) | 4'b0000;
+	assign ALUop = ({4{ALU_And}} & 4'b001) |
+					({4{ALU_Or}} & 4'b010) |
+					({4{ALU_Sub}} & 4'b101) |
+					({4{ALU_Slt}} & 4'b110) |
+					({4{ALU_Sltu}} & 4'b111) |
+					({4{ALU_Nor}} & 4'b100) |
+					({4{ALU_Xor}} & 4'b011) |
+					({4{ALU_Movn}} & 4'b1000) |
+					({4{ALU_Movz}} & 4'b1001) |
+					({4{ALU_Sll}} & 4'b1010) |
+					({4{ALU_Srl}} & 4'b1011) | 
+					({4{ALU_Sra}} & 4'b1100) | 
+					({4{ALU_Bgez}} & 4'b1101) |
+					4'b0000;
 endmodule
